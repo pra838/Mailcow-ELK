@@ -1,0 +1,184 @@
+Docker base Mailcow mail server - postfix/rspamd/dovecot logs export to ELK Stack
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Step 1: Configure Logstash
+
+Used 3 diffrent udp ports to send logs.(12201,12202,12203)
+postfix.conf this can be any name but ending with .conf .
+
+#vim /etc/logstash/conf.d/postfix.conf
+input {
+    gelf {
+        port => 12201
+        type => "postfix"
+    }
+    gelf {
+        port => 12202
+        type => "dovecot"
+    }
+    gelf {
+        port => 12203
+        type => "rspamd"
+    }
+}
+
+filter {
+    # Add filter configurations if needed
+}
+
+output {
+    if [type] == "postfix" {
+        elasticsearch {
+            hosts => ["http://(URL or IP Address of ELK):9200"]
+            index => "postfix-logs-%{+YYYY.MM.dd}"
+            action => "create"
+        }
+        stdout { codec => rubydebug }
+    }
+
+    if [type] == "dovecot" {
+        elasticsearch {
+            hosts => ["http://(URL or IP Address of ELK):9200"]
+            index => "dovecot-logs-%{+YYYY.MM.dd}"
+            action => "create"
+        }
+        stdout { codec => rubydebug }
+    }
+
+    if [type] == "rspamd" {
+        elasticsearch {
+            hosts => ["http://(URL or IP Address of ELK):9200"]
+            index => "rspamd-logs-%{+YYYY.MM.dd}"
+            action => "create"
+        }
+        stdout { codec => rubydebug }
+    }
+}
+
+
+#systemctl restart logstash
+#systemctl status logstash  (logstash should run without issue)
+
+
+Step 2: Update Mailcow docker-compose.yml
+
+#cd /opt/mailcow-dockerized
+
+A.In postfix-mailcow segment.
+
+#vim docker-compose.yml
+***********************************************
+ logging:
+         driver: gelf
+         options:
+          gelf-address: "udp://(URL or IP Address of ELK):12201"
+          tag: "postfix"
+      dns:
+        - ${IPV4_NETWORK:-172.22.1}.254
+**************************************************(Add above content before  mailcow-network )
+      networks:
+        mailcow-network:
+		
+B.In dovecot-mailcow segment.	
+
+ dovecot-mailcow:
+      image: mailcow/dovecot:1.28.2
+      depends_on:
+        - mysql-mailcow
+        - netfilter-mailcow
+      logging:
+          driver: gelf
+          options:
+            gelf-address: "udp://(URL or IP Address of ELK):12202"
+            tag: "dovecot-*"
+      dns:
+
+C.In rspamd-mailcow segment.	
+
+  hostname: rspamd
+      logging:
+          driver: gelf
+          options:
+            gelf-address: "udp://(URL or IP Address of ELK):12203"
+            tag: "rspamd-*"
+      dns:
+        - ${IPV4_NETWORK:-172.22.1}.254
+      networks:
+
+
+	
+		
+Step 3: Restart Mailcow
+
+Restart Mailcow: After updating the docker-compose.yml, restart the Mailcow containers to apply the changes.
+
+#docker compose down && docker compose up -d
+
+
+Step 4: Verify Log Forwarding
+
+Check Logstash Logs: Ensure that Logstash is receiving logs by checking its logs.
+
+root@elk:/etc/logstash/conf.d# tail -f /var/log/logstash/logstash-plain.log
+
+[2024-08-05T11:21:02,660][INFO ][logstash.inputs.gelf     ][main][9e5d9bbfee5cb7b66fb696e9afebe799b6426288afbaaa03a9d9042685ef8eb8] Starting gelf listener (udp) ... {:address=>"0.0.0.0:12203"}
+[2024-08-05T11:21:02,660][INFO ][logstash.inputs.gelf     ][main][70e4308665fe1706982d9b68d5061e5e378e10c539016b969c11549b609021fd] Starting gelf listener (udp) ... {:address=>"0.0.0.0:12201"}
+[2024-08-05T11:21:02,678][INFO ][logstash.inputs.gelf     ][main][0ba448a694883c2b3b680cdf21775fea98fcbac74beba0406d53d71347eda26d] Starting gelf listener (udp) ... {:address=>"0.0.0.0:12202"}
+
+
+Troubleshoot
+************
+
+Check Elasticsearch: You can verify if the logs are being indexed in Elasticsearch by querying it.
+ 
+root@elk:/etc/logstash/conf.d# curl -X GET "localhost:9200/_cat/indices?v"
+health status index                                         uuid                   pri rep docs.count docs.deleted store.size pri.store.size
+yellow open   .ds-postfix-logs-2024.07.25-2024.07.25-000001 lRxJlJobQyq1EW9tpIBoZQ   1   1      17062            0      2.1mb          2.1mb
+yellow open   .ds-postfix-logs-2024.08.05-2024.08.05-000001 qaKDNdSlS52lpsAu1rwwkA   1   1      22035            0        8mb            8mb
+yellow open   .ds-postfix-logs-2024.07.22-2024.07.22-000001 kMspuYGRRsuVvjcVLOrbmg   1   1      31985            0      3.9mb          3.9mb
+yellow open   .ds-postfix-logs-2024.08.02-2024.08.02-000001 pFF6q1TrR9CR6CwTGQs5TQ   1   1     108792            0     20.3mb         20.3mb
+
+
+
+Verify Elasticsearch Index Settings
+Check Index Settings: You can check if the index is set up as a data stream by running the following command:
+
+root@elk:/etc/logstash/conf.d# curl -X GET "localhost:9200/postfix-logs-*/_search?pretty"
+{
+  "took" : 913,
+  "timed_out" : false,
+  "_shards" : {
+    "total" : 17,
+    "successful" : 17,
+    "skipped" : 0,
+    "failed" : 0
+  },
+  "hits" : {
+    "total" : {
+      "value" : 10000,
+      "relation" : "gte"
+    },
+    "max_score" : 1.0,
+    "hits" : [
+      {
+        "_index" : ".ds-postfix-logs-2021.06.01-2024.07.21-000001",
+        "_type" : "_doc",
+        "_id" : "gzZq1JABIJiceEUzpgU0",
+        "_score" : 1.0,
+        "_source" : {
+          "@timestamp" : "2021-06-01T11:43:20.000Z",
+          "source_host" : "172.20.242.100",
+          "level" : 1,
+          "message" : "Test log message",
+          "additional_field" : "value",
+          "version" : "1.1",
+          "host" : "mailcow",
+          "@version" : "1"
+        }
+      },
+      {
+
+Step 5:Access Kibana: Open Kibana in your web browser and create an index pattern for postfix-logs-* to visualize the logs.
+
+
+
